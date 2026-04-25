@@ -1,123 +1,87 @@
-import gradio as gr
+ import gradio as gr
 import numpy as np
 from scipy.io.wavfile import write
-import tempfile
-import os
+import tempfile, os
 
-SR = 48000
-DURATION = 390  # 6:30
+SR = 44100  # Slightly faster than 48k, still perfect for sub-20Hz
+DURATION = 390
 
-def generate_ambient(prompt: str):
-    t = np.arange(DURATION * SR) / SR
-    
-    def envelope(start, end, shape="linear", phase="rise"):
+def generate_ambient(prompt: str, mode: str = "Preview (1:00)"):
+    dur = 390 if mode == "Full (6:30)" else 60
+    t = np.arange(dur * SR, dtype=np.float32) / SR
+    omega = 2 * np.pi * t
+
+    def env(start, end, shape="lin", phase="rise"):
         mask = (t >= start) & (t < end)
-        frac = (t[mask] - start) / (end - start)
-        if phase == "rise":
-            val = frac if shape=="linear" else np.sqrt(frac)
-        elif phase == "fall":
-            val = 1 - frac if shape=="linear" else 1 - np.sqrt(frac)
-        elif phase == "hold":
-            val = np.ones_like(frac)
-        else:
-            val = frac
-        env = np.zeros_like(t)
-        env[mask] = val
-        return env
+        frac = (t[mask] - start) / max(end - start, 1e-6)
+        if phase == "rise": val = np.sqrt(frac) if shape!="lin" else frac
+        elif phase == "fall": val = 1 - (np.sqrt(frac) if shape!="lin" else frac)
+        elif phase == "hold": val = np.ones_like(frac)
+        else: val = frac
+        out = np.zeros(len(t), dtype=np.float32)
+        out[mask] = val
+        return out
 
-    emerge = envelope(0, 60, "linear", "rise")
-    still = envelope(60, 180, "hold")
-    peak = envelope(180, 300, "linear", "rise")
-    dissolve = envelope(300, 390, "linear", "fall")
-    
-    master_amp = np.maximum(emerge, np.maximum(still, np.maximum(peak, dissolve)))
-    kernel = np.ones(4800) / 4800
-    master_amp = np.convolve(master_amp, kernel, mode='same')
+    e = env(0, 60, "lin", "rise")
+    s = env(60, 180, "lin", "hold")
+    p = env(180, 300, "lin", "rise")
+    d = env(300, 390, "lin", "fall")
+    master = np.maximum(np.maximum(e, s), np.maximum(p, d))
+    kernel = np.ones(2205, dtype=np.float32) / 2205
+    master = np.convolve(master, kernel, mode='same')
 
-    def sine_layer(freq, amp_env, phase=0, mod=None, gain=0.15):
-        carrier = np.sin(2 * np.pi * freq * t + phase)
-        if mod is not None:
-            carrier *= mod
-        return carrier * amp_env * gain
+    def osc(freq, amp, mod=None, gain=0.15):
+        carrier = np.sin(omega * freq)
+        if mod is not None: carrier *= mod
+        return carrier * amp * gain
 
-    # Layer 1: 199 Hz + 10 Hz pulse
-    pulse_10hz = 0.5 + 0.5 * np.sin(2 * np.pi * 10 * t)
-    layer1 = sine_layer(199, master_amp, mod=pulse_10hz, gain=0.18)
-    # Layer 2: 444 Hz
-    layer2 = sine_layer(444, master_amp * envelope(0, 390, shape="log"), gain=0.14)
-    # Layer 3: 777 Hz shimmer
-    shimmer_mod = np.sin(2 * np.pi * 0.3 * t) * 5
-    layer3 = np.sin(2 * np.pi * 777 * t + shimmer_mod) * master_amp * 0.12
-    # Layer 4: 999 Hz
-    layer4 = sine_layer(999, master_amp * envelope(0, 300, shape="exp"), gain=0.11)
-    # Layer 5: Sub-20 Hz
-    layer5 = np.sin(2 * np.pi * 12 * t) * master_amp * 0.4
-    layer5 += 0.1 * np.sin(2 * np.pi * 24 * t) * master_amp
-    # Layer 6: Low pad
-    layer6 = sine_layer(88, master_amp * 0.7, gain=0.13)
+    pulse = 0.5 + 0.5 * np.sin(omega * 10)
+    l1 = osc(199, master, mod=pulse, gain=0.18)
+    l2 = osc(444, master * env(0, dur, "log"), gain=0.14)
+    l3 = np.sin(omega * 777 + np.sin(omega * 0.3) * 5) * master * 0.12
+    l4 = osc(999, master * env(0, min(300, dur), "exp"), gain=0.11)
+    l5 = np.sin(omega * 12) * master * 0.4 + 0.1 * np.sin(omega * 24) * master
+    l6 = osc(88, master * 0.7, gain=0.13)
 
-    mix = layer1 + layer2 + layer3 + layer4 + layer5 + layer6
-    peak_val = np.max(np.abs(mix))
-    if peak_val > 0:
-        mix = mix / peak_val * 0.85
+    mix = l1 + l2 + l3 + l4 + l5 + l6
+    peak = np.max(np.abs(mix))
+    if peak > 0: mix /= peak
+    mix *= 0.85
 
-    # Voice at 1:30 with reverb simulation
-    voice_start = 90 * SR
-    voice_dur = 5.0
-    v_t = np.arange(int(voice_dur * SR)) / SR
-    voice_wave = (
-        0.4 * np.sin(2 * np.pi * 120 * v_t) +
-        0.2 * np.sin(2 * np.pi * 240 * v_t) +
-        0.1 * np.sin(2 * np.pi * 360 * v_t)
-    )
-    voice_env = np.exp(-((v_t - 2.0)**2) / 1.2)
-    voice_wave = voice_wave * voice_env
-    # Simple delay for space effect
-    delayed = np.zeros_like(voice_wave)
-    delay_samples = int(0.4 * SR)
-    for i in range(delay_samples, len(voice_wave)):
-        delayed[i] = voice_wave[i - delay_samples] * 0.3
-    voice_processed = voice_wave + delayed * 0.6
-    
-    end_idx = min(voice_start + len(voice_processed), len(mix))
-    mix[voice_start:end_idx] += voice_processed[:end_idx-voice_start] * 0.5
+    if dur >= 95:
+        vs = 90 * SR
+        vd = 5 * SR
+        vt = np.arange(vd, dtype=np.float32) / SR
+        vw = (0.4*np.sin(2*np.pi*120*vt) + 0.2*np.sin(2*np.pi*240*vt) + 0.1*np.sin(2*np.pi*360*vt))
+        ve = np.exp(-((vt - 2.0)**2) / 1.2)
+        vw *= ve
+        delay = int(0.4 * SR)
+        delayed = np.zeros(vd, dtype=np.float32)
+        delayed[delay:] = vw[:-delay] * 0.3
+        vp = vw + delayed * 0.6
+        end = min(vs + len(vp), len(mix))
+        mix[vs:end] += vp[:end-vs] * 0.5
 
-    peak_val = np.max(np.abs(mix))
-    if peak_val > 0:
-        mix = mix / peak_val * 0.9
+    peak = np.max(np.abs(mix))
+    if peak > 0: mix /= peak
 
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-        write(tmp.name, SR, np.int16(mix * 32767))
+        write(tmp.name, SR, np.int16(np.clip(mix, -1, 1) * 32767))
         return tmp.name
 
 def ui():
     with gr.Blocks(title="Ambient Architect", theme=gr.themes.Soft()) as demo:
         gr.Markdown("## 🌌 Ambient Sound Architect")
-        gr.Markdown("Generate precise ambient audio with exact frequency layers.")
-        
+        gr.Markdown("Use **Preview** for fast testing. Switch to **Full** for final renders.")
         with gr.Row():
-            with gr.Column(scale=2):
-                prompt = gr.Textbox(
-                    label="Prompt",
-                    value="Ambient. No melody, no drums. Six tonal layers: 199 Hz carrier + 10 Hz pulse (felt not heard) + 444 Hz + 777 Hz shimmer + 999 Hz top tone + sub-20 Hz subsonic. Arc: emerge lowest-first (0-1 min) → pressurized stillness (1-3 min) → expansion peak (3-5 min) → dissolve top-down (5-6:30) → silence. Voice at 1:30 deep reverb: 'Omnithral Vex\\'arion Tava\\'rel. Open. Expand. Become.' Mood: Vast, outward sphere, deep space resonance.",
-                    lines=6
-                )
-                generate_btn = gr.Button("✨ Generate Audio", variant="primary")
-            with gr.Column(scale=1):
-                output_audio = gr.Audio(label="Result", type="filepath")
-                download_btn = gr.File(label="Download WAV")
-        
-        generate_btn.click(
-            fn=generate_ambient,
-            inputs=prompt,
-            outputs=output_audio
-        ).then(
-            fn=lambda x: x,
-            inputs=output_audio,
-            outputs=download_btn
-        )
+            with gr.Column():
+                prompt = gr.Textbox(label="Prompt", lines=4, 
+                    value="Ambient. No melody, no drums. Six tonal layers: 199 Hz carrier + 10 Hz pulse + 444 Hz + 777 Hz shimmer + 999 Hz top tone + sub-20 Hz subsonic. Arc: emerge (0-1) → stillness (1-3) → peak (3-5) → dissolve (5-6:30) → silence. Voice at 1:30: 'Omnithral Vex\\'arion Tava\\'rel. Open. Expand. Become.'")
+                mode = gr.Radio(["Preview (1:00)", "Full (6:30)"], value="Preview (1:00)", label="Render Mode")
+                btn = gr.Button("✨ Generate", variant="primary")
+            out = gr.Audio(label="Result", type="filepath")
+        btn.click(generate_ambient, inputs=[prompt, mode], outputs=out)
     return demo
 
 if __name__ == "__main__":
-    demo = ui()
-    demo.launch(server_name="0.0.0.0", server_port=int(os.getenv("PORT", 7860)))
+    ui().launch(server_name="0.0.0.0", server_port=int(os.getenv("PORT", 7860)))
